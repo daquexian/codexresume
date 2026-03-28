@@ -1,0 +1,28 @@
+[package]
+name = "codexresume"
+version = "0.1.0"
+description = "A TUI wrapper around `codex resume` that shows local sessions across providers"
+edition = "2024"
+license = "Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/codexresume"
+keywords = ["codex", "tui", "cli", "sqlite"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4.43"
+color-eyre = "0.6.3"
+crossterm = "0.28.1"
+dirs = "6"
+ratatui = "0.29.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread"] }
+toml = "0.8"
+unicode-width = "0.2"
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"
+tempfile = "3"
