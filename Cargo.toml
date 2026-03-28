@@ -6,6 +6,8 @@ edition = "2024"
 license = "Apache-2.0"
 readme = "README.md"
 documentation = "https://docs.rs/codexresume"
+homepage = "https://github.com/daquexian/codexresume"
+repository = "https://github.com/daquexian/codexresume"
 keywords = ["codex", "tui", "cli", "sqlite"]
 categories = ["command-line-utilities"]
 
