@@ -53,12 +53,20 @@ impl ProviderVisibility {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SessionDbOptions {
+    pub provider_visibility: ProviderVisibility,
+    pub include_non_interactive: bool,
+    pub include_archived: bool,
+    pub filter_cwd: Option<PathBuf>,
+}
+
 #[derive(Clone)]
 pub struct SessionDb {
     pool: SqlitePool,
     schema: ThreadSchema,
     session_index_path: PathBuf,
-    provider_visibility: ProviderVisibility,
+    options: SessionDbOptions,
 }
 
 #[derive(Debug)]
@@ -117,15 +125,15 @@ impl ThreadSchema {
 
 pub async fn open_session_db(
     paths: &ResolvedPaths,
-    provider_visibility: ProviderVisibility,
+    db_options: SessionDbOptions,
 ) -> anyhow::Result<SessionDb> {
-    let options = SqliteConnectOptions::new()
+    let connect_options = SqliteConnectOptions::new()
         .filename(&paths.state_db_path)
         .create_if_missing(false)
         .read_only(true);
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
-        .connect_with(options)
+        .connect_with(connect_options)
         .await
         .with_context(|| {
             format!(
@@ -139,22 +147,23 @@ pub async fn open_session_db(
         pool,
         schema,
         session_index_path: paths.session_index_path.clone(),
-        provider_visibility,
+        options: db_options,
     })
 }
 
 impl SessionDb {
     pub async fn load_page(&self, sort_key: SortKey, offset: usize) -> anyhow::Result<SessionPage> {
-        let db_rows = sqlx::query(&page_query_sql(
-            &self.schema,
-            self.provider_visibility,
-            sort_key,
-        ))
-        .bind(PAGE_SIZE as i64)
-        .bind(offset as i64)
-        .fetch_all(&self.pool)
-        .await
-        .context("failed to query threads from state db")?;
+        let query = page_query_sql(&self.schema, &self.options, sort_key);
+        let mut db_query = sqlx::query(&query.sql);
+        if let Some(cwd) = query.cwd_bind.as_deref() {
+            db_query = db_query.bind(cwd);
+        }
+        let db_rows = db_query
+            .bind(PAGE_SIZE as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to query threads from state db")?;
 
         let mut rows = db_rows
             .into_iter()
@@ -166,6 +175,21 @@ impl SessionDb {
             has_more: rows.len() == PAGE_SIZE,
             rows,
         })
+    }
+
+    pub async fn select_last_thread_id(&self) -> anyhow::Result<Option<String>> {
+        let query = last_thread_id_query_sql(&self.schema, &self.options);
+        let mut db_query = sqlx::query(&query.sql);
+        if let Some(cwd) = query.cwd_bind.as_deref() {
+            db_query = db_query.bind(cwd);
+        }
+        let row = db_query
+            .fetch_optional(&self.pool)
+            .await
+            .context("failed to query last thread id from state db")?;
+        row.map(|row| row.try_get::<String, _>("id"))
+            .transpose()
+            .context("failed to decode last thread id")
     }
 }
 
@@ -190,26 +214,29 @@ async fn load_thread_schema(pool: &SqlitePool) -> anyhow::Result<ThreadSchema> {
     Ok(ThreadSchema { columns })
 }
 
+struct ThreadsQuery {
+    sql: String,
+    cwd_bind: Option<String>,
+}
+
 fn page_query_sql(
     schema: &ThreadSchema,
-    provider_visibility: ProviderVisibility,
+    options: &SessionDbOptions,
     sort_key: SortKey,
-) -> String {
-    let provider_filter = match provider_visibility {
-        ProviderVisibility::All => String::new(),
-        ProviderVisibility::OnlyOpenAi if schema.has("model_provider") => {
-            format!("WHERE model_provider = '{OPENAI_PROVIDER_ID}'")
-        }
-        ProviderVisibility::OnlyOpenAi => String::new(),
-    };
+) -> ThreadsQuery {
+    let where_clause = threads_where_clause(schema, options);
+    let clause = where_clause.clause.clone();
+    let cwd_bind = where_clause.cwd_bind.clone();
     let sort_column = match sort_key {
         SortKey::UpdatedAt if schema.has("updated_at") => "updated_at",
         SortKey::CreatedAt if schema.has("created_at") => "created_at",
         SortKey::UpdatedAt | SortKey::CreatedAt => "id",
     };
 
-    format!(
-        r#"
+    ThreadsQuery {
+        cwd_bind,
+        sql: format!(
+            r#"
 SELECT
     id,
     {},
@@ -223,21 +250,87 @@ SELECT
     {},
     {}
 FROM threads
-{provider_filter}
+{clause}
 ORDER BY {sort_column} DESC, id DESC
 LIMIT ? OFFSET ?
         "#,
-        schema.select_expr("rollout_path", "''"),
-        schema.select_expr("created_at", "NULL"),
-        schema.select_expr("updated_at", "NULL"),
-        schema.select_expr("archived", "0"),
-        schema.select_expr("source", "''"),
-        schema.select_expr("model_provider", "''"),
-        schema.select_expr("cwd", "''"),
-        schema.select_expr("title", "''"),
-        schema.select_expr("first_user_message", "''"),
-        schema.select_expr("git_branch", "NULL"),
-    )
+            schema.select_expr("rollout_path", "''"),
+            schema.select_expr("created_at", "NULL"),
+            schema.select_expr("updated_at", "NULL"),
+            schema.select_expr("archived", "0"),
+            schema.select_expr("source", "''"),
+            schema.select_expr("model_provider", "''"),
+            schema.select_expr("cwd", "''"),
+            schema.select_expr("title", "''"),
+            schema.select_expr("first_user_message", "''"),
+            schema.select_expr("git_branch", "NULL"),
+        ),
+    }
+}
+
+fn last_thread_id_query_sql(schema: &ThreadSchema, options: &SessionDbOptions) -> ThreadsQuery {
+    let where_clause = threads_where_clause(schema, options);
+    let clause = where_clause.clause.clone();
+    let cwd_bind = where_clause.cwd_bind.clone();
+    let sort_column = if schema.has("updated_at") {
+        "updated_at"
+    } else if schema.has("created_at") {
+        "created_at"
+    } else {
+        "id"
+    };
+    ThreadsQuery {
+        cwd_bind,
+        sql: format!(
+            r#"
+SELECT id
+FROM threads
+{clause}
+ORDER BY {sort_column} DESC, id DESC
+LIMIT 1
+            "#
+        ),
+    }
+}
+
+struct WhereClause {
+    clause: String,
+    cwd_bind: Option<String>,
+}
+
+impl std::fmt::Display for WhereClause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.clause)
+    }
+}
+
+fn threads_where_clause(schema: &ThreadSchema, options: &SessionDbOptions) -> WhereClause {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cwd_bind = None;
+
+    if matches!(options.provider_visibility, ProviderVisibility::OnlyOpenAi)
+        && schema.has("model_provider")
+    {
+        parts.push(format!("model_provider = '{OPENAI_PROVIDER_ID}'"));
+    }
+    if !options.include_archived && schema.has("archived") {
+        parts.push("archived = 0".to_string());
+    }
+    if !options.include_non_interactive && schema.has("source") {
+        parts.push("source IN ('cli', 'vscode')".to_string());
+    }
+    if let Some(filter_cwd) = options.filter_cwd.as_ref().filter(|_| schema.has("cwd")) {
+        parts.push("cwd = ?".to_string());
+        cwd_bind = Some(filter_cwd.display().to_string());
+    }
+
+    let clause = if parts.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", parts.join(" AND "))
+    };
+
+    WhereClause { clause, cwd_bind }
 }
 
 fn row_to_session(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<SessionRow> {
@@ -402,32 +495,43 @@ mod tests {
 
     #[test]
     fn page_query_sql_filters_only_openai_provider_when_requested() {
+        let options = SessionDbOptions {
+            provider_visibility: ProviderVisibility::OnlyOpenAi,
+            include_non_interactive: true,
+            include_archived: true,
+            filter_cwd: None,
+        };
         let sql = page_query_sql(
             &schema(&["id", "created_at", "updated_at", "model_provider"]),
-            ProviderVisibility::OnlyOpenAi,
+            &options,
             SortKey::UpdatedAt,
-        );
+        )
+        .sql;
         assert_eq!(
             sql.contains(&format!("WHERE model_provider = '{OPENAI_PROVIDER_ID}'")),
             true
         );
 
-        let sql = page_query_sql(
-            &schema(&["id", "created_at"]),
-            ProviderVisibility::All,
-            SortKey::CreatedAt,
-        );
+        let options = SessionDbOptions {
+            provider_visibility: ProviderVisibility::All,
+            include_non_interactive: true,
+            include_archived: true,
+            filter_cwd: None,
+        };
+        let sql = page_query_sql(&schema(&["id", "created_at"]), &options, SortKey::CreatedAt).sql;
         assert_eq!(sql.contains("WHERE model_provider ="), false);
         assert_eq!(sql.contains("ORDER BY created_at DESC, id DESC"), true);
     }
 
     #[test]
     fn page_query_sql_falls_back_when_optional_columns_are_missing() {
-        let sql = page_query_sql(
-            &schema(&["id"]),
-            ProviderVisibility::OnlyOpenAi,
-            SortKey::UpdatedAt,
-        );
+        let options = SessionDbOptions {
+            provider_visibility: ProviderVisibility::OnlyOpenAi,
+            include_non_interactive: true,
+            include_archived: true,
+            filter_cwd: None,
+        };
+        let sql = page_query_sql(&schema(&["id"]), &options, SortKey::UpdatedAt).sql;
 
         assert_eq!(sql.contains("NULL AS created_at"), true);
         assert_eq!(sql.contains("NULL AS updated_at"), true);

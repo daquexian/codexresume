@@ -2,8 +2,8 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::data::ProviderVisibility;
 use crate::data::SessionDb;
+use crate::data::SessionDbOptions;
 use crate::data::SessionPage;
 use crate::data::SessionRow;
 use crate::data::SortKey;
@@ -33,12 +33,12 @@ type PageLoader = Arc<dyn Fn(PageLoadRequest) + Send + Sync>;
 
 pub async fn run_picker(
     session_db: SessionDb,
-    provider_visibility: ProviderVisibility,
+    options: SessionDbOptions,
 ) -> io::Result<Option<SessionRow>> {
     let (page_tx, mut page_rx) = mpsc::unbounded_channel();
     let page_loader = create_page_loader(session_db, page_tx);
     let mut tui = TuiGuard::new()?;
-    let mut state = PickerState::new(provider_visibility, page_loader);
+    let mut state = PickerState::new(options, page_loader);
     state.start_initial_load();
 
     loop {
@@ -119,7 +119,7 @@ struct PickerState {
     view_rows: usize,
     query: String,
     sort_key: SortKey,
-    provider_visibility: ProviderVisibility,
+    options: SessionDbOptions,
     has_more: bool,
     loading: bool,
     next_offset: usize,
@@ -130,7 +130,7 @@ struct PickerState {
 }
 
 impl PickerState {
-    fn new(provider_visibility: ProviderVisibility, page_loader: PageLoader) -> Self {
+    fn new(options: SessionDbOptions, page_loader: PageLoader) -> Self {
         Self {
             page_loader,
             all_rows: Vec::new(),
@@ -140,7 +140,7 @@ impl PickerState {
             view_rows: 1,
             query: String::new(),
             sort_key: SortKey::UpdatedAt,
-            provider_visibility,
+            options,
             has_more: true,
             loading: false,
             next_offset: 0,
@@ -387,10 +387,10 @@ fn draw(frame: &mut Frame, state: &mut PickerState) {
         "  ".into(),
         "Providers:".dim(),
         " ".into(),
-        state.provider_visibility.label().green(),
+        state.options.provider_visibility.label().green(),
         "  ".into(),
         "Scope:".dim(),
-        " all sources / all cwd / archived".green(),
+        scope_label(state.options.clone()).green(),
     ]
     .into();
     frame.render_widget(Paragraph::new(header_line), header);
@@ -452,6 +452,25 @@ fn hint_line() -> Line<'static> {
         " to browse".dim(),
     ]
     .into()
+}
+
+fn scope_label(options: SessionDbOptions) -> String {
+    let sources = if options.include_non_interactive {
+        "all sources"
+    } else {
+        "interactive only"
+    };
+    let cwd = if options.filter_cwd.is_some() {
+        "cwd"
+    } else {
+        "all cwd"
+    };
+    let archived = if options.include_archived {
+        "archived"
+    } else {
+        "no archived"
+    };
+    format!("{sources} / {cwd} / {archived}")
 }
 
 fn list_lines(
